@@ -8,6 +8,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
+
       - name: 1. Enable RDP & Firewall
         shell: powershell
         run: |
@@ -23,57 +24,142 @@ jobs:
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: 2. Set User Password
+          Write-Host "RDP and Firewall configured."
+
+      - name: 2. Set RDP User Password
         shell: powershell
         run: |
           $pass = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $pass
 
-      - name: 3. Install & Start Ngrok
+          Set-LocalUser `
+            -Name "runneradmin" `
+            -Password $pass
+
+          Write-Host "RDP password configured."
+
+      - name: 3. Install Ngrok
         shell: powershell
         run: |
-          choco install ngrok --no-progress
+          choco install ngrok --no-progress -y
 
-          # EXAMPLE TOKEN — replace with your own token
+          if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) {
+            throw "Ngrok installation failed."
+          }
+
+          ngrok version
+
+      - name: 4. Configure Ngrok
+        shell: powershell
+        run: |
+          # EXAMPLE ONLY — this token has been revoked
           $NGROK_AUTH_TOKEN = "3IXpT9fnoRZ7tLcISD8EUe120wn_2KVwHSBTbKyQrPcCC3gxm"
 
           ngrok config add-authtoken $NGROK_AUTH_TOKEN
 
-          Start-Process ngrok -ArgumentList "tcp 3389"
+          Write-Host "Ngrok authentication configured."
 
-          Start-Sleep -Seconds 10
+      - name: 5. Start Ngrok Tunnel
+        shell: powershell
+        run: |
+          $logFile = "$env:TEMP\ngrok.log"
 
-      - name: 4. Get Connection Info
+          if (Test-Path $logFile) {
+            Remove-Item $logFile -Force
+          }
+
+          $ngrok = Start-Process `
+            -FilePath "ngrok.exe" `
+            -ArgumentList "tcp 3389 --log=stdout" `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError "$env:TEMP\ngrok-error.log" `
+            -PassThru `
+            -WindowStyle Hidden
+
+          Write-Host "Ngrok started. PID: $($ngrok.Id)"
+
+          $ready = $false
+
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($ngrok.HasExited) {
+              Write-Host "Ngrok exited unexpectedly."
+              break
+            }
+
+            try {
+              $response = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:4040/api/tunnels" `
+                -TimeoutSec 3
+
+              if ($response.tunnels.Count -gt 0) {
+                $ready = $true
+                Write-Host "Ngrok tunnel is ready."
+                break
+              }
+            }
+            catch {
+              Write-Host "Waiting for Ngrok API... ($i/30)"
+            }
+          }
+
+          if (-not $ready) {
+            Write-Host "===== NGROK OUTPUT ====="
+
+            if (Test-Path $logFile) {
+              Get-Content $logFile
+            }
+
+            Write-Host "===== NGROK ERROR ====="
+
+            if (Test-Path "$env:TEMP\ngrok-error.log") {
+              Get-Content "$env:TEMP\ngrok-error.log"
+            }
+
+            throw "Ngrok tunnel did not become ready."
+          }
+
+      - name: 6. Get RDP Connection Info
         shell: powershell
         run: |
           try {
-            $tunnels = Invoke-RestMethod "http://localhost:4040/api/tunnels"
+            $tunnels = Invoke-RestMethod `
+              -Uri "http://127.0.0.1:4040/api/tunnels" `
+              -TimeoutSec 10
 
-            if (-not $tunnels.tunnels) {
-              throw "No Ngrok tunnel found."
+            $tunnel = $tunnels.tunnels |
+              Where-Object { $_.proto -eq "tcp" } |
+              Select-Object -First 1
+
+            if (-not $tunnel) {
+              throw "No TCP Ngrok tunnel found."
             }
 
-            $url = $tunnels.tunnels[0].public_url
-            $cleanUrl = $url.Replace("tcp://", "")
+            $address = $tunnel.public_url -replace "^tcp://", ""
 
-            Write-Host "================================"
-            Write-Host "RDP Address: $cleanUrl"
-            Write-Host "Username: runneradmin"
-            Write-Host "Password: P@ssw0rd!"
-            Write-Host "================================"
+            Write-Host ""
+            Write-Host "======================================"
+            Write-Host "       RDP CONNECTION INFO"
+            Write-Host "======================================"
+            Write-Host "RDP Address : $address"
+            Write-Host "Username    : runneradmin"
+            Write-Host "Password    : P@ssw0rd!"
+            Write-Host "======================================"
+            Write-Host ""
 
-            echo "::notice title=RDP Address::$cleanUrl"
-            echo "::notice title=Username::runneradmin"
+            echo "::notice title=RDP Address::$address"
+            echo "::notice title=RDP Username::runneradmin"
           }
           catch {
-            Write-Error "Ngrok failed: $($_.Exception.Message)"
+            Write-Error "Could not get Ngrok connection info: $($_.Exception.Message)"
             exit 1
           }
 
-      - name: 5. Keep Session Alive
+      - name: 7. Keep Session Alive
         shell: powershell
         run: |
-          Write-Host "Session is active."
+          Write-Host "RDP session is active."
+          Write-Host "Cancel the workflow to stop the session."
 
           while ($true) {
             Start-Sleep -Seconds 60
